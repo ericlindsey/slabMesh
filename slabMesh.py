@@ -13,6 +13,7 @@ from netCDF4 import Dataset
 # available from conda forge (conda install -c conda-forge meshpy)
 import meshpy.triangle as triangle
 
+
 # slab 2.0 import and manipulation functions
 ######
 
@@ -69,21 +70,132 @@ def my_griddata(xin,yin,zin,xout,yout):
 def round_trip_connect(start, end):
     return [(i, i+1) for i in range(start, end)] + [(end, start)]
 
-def needs_refinement(vertices, area):
-    bary = np.sum(np.array(vertices), axis=0)/3
-    max_area = 0.005 + (la.norm(bary, np.inf)-1)*0.0005
-    return bool(area > max_area)
+# Define a function that returns a refinement function with the threshold captured:
+def get_simple_refinement(threshold, max_refinements):
 
-def make_mesh(Xpoly,Ypoly):
+    # Use a mutable container to track the count
+    refinement_count = [0]
+
+    def refinement(vertices, area):
+        # Increase the counter for each triangle evaluated.
+        refinement_count[0] += 1
+        if refinement_count[0] > max_refinements:
+            # If we have reached the maximum, stop refining.
+            print("Maximum refinements reached.")
+            return False
+        return area > threshold
+    
+    return refinement
+
+def get_depth_based_refinement(depth_interp, base_threshold=0.03, factor=0.00007, max_refinements=1e5):
+    """
+    Returns a refinement function that uses depth information.
+    
+    Parameters:
+      depth_interp: callable, a function f(x, y) that returns depth z.
+      base_threshold: float, the baseline area threshold.
+      factor: float, scaling factor to adjust threshold based on depth.
+      max_refinements: int, maximum number of refinement calls allowed.
+
+    The threshold is computed as:
+      threshold = base_threshold + factor * (depth - 1)
+    so deeper (larger depth) triangles get a higher threshold;
+    this assumes positive depth values.
+
+    """
+    # Use a mutable container to track the count
+    refinement_count = [0]
+
+    def refinement(vertices, area):
+        # Increase the counter for each triangle evaluated.
+        refinement_count[0] += 1
+        if refinement_count[0] > max_refinements:
+            # If we have reached the maximum, stop refining.
+            print("Maximum refinements reached.")
+            return False
+        # Compute the barycenter (mean of the vertices).
+        bary = np.mean(vertices, axis=0)
+        # Lookup the depth at the barycenter. Handle missing values.
+        depth = depth_interp(bary[0], bary[1])
+        if depth is None or np.isnan(depth):
+            depth = 0  # Or choose a default, safe value.
+        threshold = base_threshold + factor * (depth - 1)
+        # Return True if the triangle area exceeds the threshold.
+        return area > threshold
+    
+    return refinement
+
+
+def fix_vertical_edges(X, Y, tolerance=1e-8, offset=1e-6):
+    """
+    Adjusts vertices of a polygon to avoid vertical (or nearly vertical) segments.
+    
+    Parameters:
+      X, Y : array-like
+          Coordinates of the polygon vertices.
+      tolerance : float
+          Tolerance for considering a segment as vertical (difference in X).
+      offset : float
+          The fixed offset added to the x-coordinate to break verticality.
+    
+    Returns:
+      X_fixed : np.ndarray
+          The adjusted x-coordinates.
+      Y : np.ndarray
+          The y-coordinates (unchanged).
+    """
+    X_fixed = np.array(X, dtype=float)
+    n = len(X_fixed)
+    for i in range(n):
+        # Wrap-around index for closed polygon
+        j = (i + 1) % n
+        dx = X_fixed[j] - X_fixed[i]
+        dy = Y[j] - Y[i]
+        # Calculate the angle in radians using arctan2; vertical if angle near pi/2 or -pi/2.
+        angle = np.arctan2(dy, dx)
+        if np.abs(np.abs(angle) - np.pi/2) < 1e-4 or np.abs(dx) < tolerance:
+            # Deterministically adjust the second vertex's x value.
+            # Here we always add a small offset. Alternatively, you could decide based on the vertex's position.
+            X_fixed[j] = X_fixed[i] + offset
+            print(f"Adjusted vertex {j} from x={X[j]} to x={X_fixed[j]} to avoid vertical segment.")
+    return X_fixed, np.array(Y)
+
+def make_mesh(Xpoly,Ypoly,threshold=0.03,max_refinements=100000):
     # create the mesh using meshpy.triangle
-    points=[pt for pt in zip(Xpoly,Ypoly)]
-    facets = round_trip_connect(0, len(points)-1)
-    info = triangle.MeshInfo()
-    info.set_points(points)
-    info.set_facets(facets)
-    mesh = triangle.build(info, refinement_func=needs_refinement)
-    mesh_points = np.array(mesh.points)
-    mesh_tris = np.array(mesh.elements)
+    try:
+        Xpoly_fixed, Ypoly_fixed = fix_vertical_edges(Xpoly, Ypoly)
+        points=[pt for pt in zip(Xpoly_fixed,Ypoly_fixed)]
+        facets = round_trip_connect(0, len(points)-1)
+        info = triangle.MeshInfo()
+        info.set_points(points)
+        info.set_facets(facets)
+        refinement_func = get_simple_refinement(threshold, max_refinements)
+        mesh = triangle.build(info, refinement_func=refinement_func)
+        mesh_points = np.array(mesh.points)
+        mesh_tris = np.array(mesh.elements)
+    except Exception as e:
+        print("error:", e)
+    return mesh_points,mesh_tris
+
+
+def make_depth_variable_mesh(Xpoly,Ypoly,depth_interp,threshold=0.03,factor=0.00007,max_refinements=100000):
+    # create the mesh using meshpy.triangle
+    try:
+        Xpoly_fixed, Ypoly_fixed = fix_vertical_edges(Xpoly, Ypoly)
+        points=[pt for pt in zip(Xpoly_fixed,Ypoly_fixed)]
+        facets = round_trip_connect(0, len(points)-1)
+        info = triangle.MeshInfo()
+        info.set_points(points)
+        info.set_facets(facets)
+        
+        # Create the depth-based refinement function.
+        refinement_func = get_depth_based_refinement(depth_interp, threshold, factor, max_refinements)
+
+        mesh = triangle.build(info, refinement_func=refinement_func)
+        mesh_points = np.array(mesh.points)
+        mesh_tris = np.array(mesh.elements)
+    except Exception as e:
+        print("error:", e)
     return mesh_points,mesh_tris
 
 # output functions
